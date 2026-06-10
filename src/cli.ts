@@ -1,4 +1,9 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --env-file=/dev/null
+
+// --env-file=/dev/null: without it, Bun auto-loads .env/.env.local from the
+// CWD into process.env, so running gbrain inside any app repo silently
+// hijacks the brain onto that app's DATABASE_URL. Real exported env vars
+// (the operator escape hatch, incl. CI) still pass through.
 
 import { installSigchldHandler } from './core/zombie-reap.ts';
 installSigchldHandler();

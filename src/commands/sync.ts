@@ -2094,6 +2094,18 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
         serr(`  Warning: skipped ${path}: ${msg}`);
         if (process.env.GBRAIN_DEBUG_STACK && e instanceof Error) {
           serr(`  [debug-stack] ${e.stack ?? '(no stack)'}`);
+          const q = (e as any).query;
+          if (typeof q === 'string') serr(`  [debug-query] ${q.slice(0, 300).replace(/\s+/g, ' ')}`);
+          const params = (e as any).parameters;
+          if (Array.isArray(params)) {
+            for (let i = 0; i < params.length; i++) {
+              const v = params[i];
+              if (typeof v === 'string' && v.includes('\u0000')) {
+                const at = v.indexOf('\u0000');
+                serr(`  [debug-param] $${i + 1} contains U+0000 at offset ${at}; context: ${JSON.stringify(v.slice(Math.max(0, at - 80), at + 80))}`);
+              }
+            }
+          }
         }
         failedFiles.push({ path, error: msg });
       } finally {

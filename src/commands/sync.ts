@@ -2092,6 +2092,9 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);
         serr(`  Warning: skipped ${path}: ${msg}`);
+        if (process.env.GBRAIN_DEBUG_STACK && e instanceof Error) {
+          serr(`  [debug-stack] ${e.stack ?? '(no stack)'}`);
+        }
         failedFiles.push({ path, error: msg });
       } finally {
         permit.release();

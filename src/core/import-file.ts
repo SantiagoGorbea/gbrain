@@ -358,6 +358,22 @@ export async function importFromContent(
     };
   }
 
+  // U+0000 guard (2026-08-21 phantom-NUL sync block): Postgres can never
+  // store a NUL in text/jsonb — any U+0000 that survives to a parameter
+  // kills the whole INSERT with `invalid byte sequence for encoding "UTF8":
+  // 0x00` and blocks the sync bookmark. Everything downstream (title,
+  // frontmatter, chunks, link contexts) derives from `content`, so one
+  // strip here is the single choke point — before parseMarkdown AND before
+  // the guardrail seam observes the payload. Loud on stderr because a NUL
+  // in markdown means the producer wrote garbage worth investigating.
+  if (content.includes('\u0000')) {
+    const count = content.split('\u0000').length - 1;
+    process.stderr.write(
+      `[gbrain] NUL-byte guard: ${slug} — stripped ${count} U+0000 byte(s) before import (Postgres cannot store NUL in text)\n`,
+    );
+    content = content.replaceAll('\u0000', '');
+  }
+
   const parsed = parseMarkdown(content, slug + '.md', {
     validate: true,
     ...(opts.activePack ? { activePack: opts.activePack } : {}),

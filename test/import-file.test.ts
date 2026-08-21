@@ -860,5 +860,34 @@ describe('importFromContent type round-trip (#1035)', () => {
     ].join('\n'), { noEmbed: true });
     expect(result.status).toBe('imported');
     expect(putType).toBe('person'); // /people/ path-prefix inference intact
+
+// ── U+0000 guard (2026-08-21) ───────────────────────────────
+// Postgres can never store a NUL in text/jsonb; a stray U+0000 anywhere in
+// the content used to kill the whole page INSERT with the pg error
+// "invalid byte sequence for encoding UTF8: 0x00" and block the sync
+// bookmark. The guard strips it at the importFromContent choke point so
+// nothing downstream (title, frontmatter, chunks, links) can carry one.
+// NUL is constructed via fromCharCode so this source file stays byte-clean.
+
+describe('importFromContent NUL guard', () => {
+  const NUL = String.fromCharCode(0);
+
+  test('strips U+0000 before anything reaches the engine', async () => {
+    const engine = mockEngine();
+    const content = '---\ntitle: NUL' + NUL + ' Test\n---\n\nbody with a ' + NUL + ' byte and more.\n';
+    const result = await importFromContent(engine, 'inbox/nul-test', content, { noEmbed: true });
+    expect(result.status).toBe('imported');
+    const calls = (engine as any)._calls as { method: string; args: any[] }[];
+    const putPage = calls.find(c => c.method === 'putPage');
+    expect(putPage).toBeDefined();
+    expect(JSON.stringify(putPage!.args).includes('\\u0000')).toBe(false);
+    expect(result.parsedPage!.compiled_truth.includes(NUL)).toBe(false);
+    expect(result.parsedPage!.title.includes(NUL)).toBe(false);
+  });
+
+  test('clean content is untouched (no warn path)', async () => {
+    const engine = mockEngine();
+    const result = await importFromContent(engine, 'inbox/clean-test', '# Clean\n\nno nulls here\n', { noEmbed: true });
+    expect(result.status).toBe('imported');
   });
 });

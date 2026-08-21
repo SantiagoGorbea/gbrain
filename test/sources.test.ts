@@ -339,3 +339,50 @@ describe('sources federate / unfederate', () => {
     expect(parsed.federated).toBe(false);
   });
 });
+
+// ── list: archived visibility (2026-08-21) ──────────────────
+// Regression: runList built its entries WITHOUT copying `archived` off the
+// loaded row, so the '⚠ archived' marker could never fire and an archived
+// source printed as 'isolated' — hiding that it was purge-eligible. An
+// active 44-page source sat at "expires in 0h" looking healthy.
+
+describe('sources list archived marker', () => {
+  const SELECT_ROWS = 'SELECT id, name, local_path, last_commit, last_sync_at, config, created_at';
+
+  function capture(): { logs: string[]; restore: () => void } {
+    const logs: string[] = [];
+    const orig = console.log;
+    console.log = (...a: unknown[]) => { logs.push(a.map(String).join(' ')); };
+    return { logs, restore: () => { console.log = orig; } };
+  }
+
+  test('archived row prints archived marker and wins over federated', async () => {
+    const { engine } = makeStub({
+      [SELECT_ROWS]: [
+        { id: 'arch', name: 'arch', local_path: '/tmp/a', last_commit: null, last_sync_at: null, config: '{"federated":true}', created_at: new Date(), archived: true },
+        { id: 'live', name: 'live', local_path: '/tmp/l', last_commit: null, last_sync_at: null, config: '{}', created_at: new Date(), archived: false },
+      ],
+      'COUNT(*)::int AS n FROM pages': [{ n: 3 }],
+    });
+    const cap = capture();
+    try { await runSources(engine, ['list']); } finally { cap.restore(); }
+    const archLine = cap.logs.find(l => l.includes('arch') && !l.includes('/tmp'));
+    const liveLine = cap.logs.find(l => l.includes('live') && !l.includes('/tmp'));
+    expect(archLine).toContain('archived');
+    expect(archLine).not.toContain('federated');
+    expect(liveLine).toContain('isolated');
+  });
+
+  test('json output carries the archived flag', async () => {
+    const { engine } = makeStub({
+      [SELECT_ROWS]: [
+        { id: 'arch', name: 'arch', local_path: '/tmp/a', last_commit: null, last_sync_at: null, config: '{}', created_at: new Date(), archived: true },
+      ],
+      'COUNT(*)::int AS n FROM pages': [{ n: 0 }],
+    });
+    const cap = capture();
+    try { await runSources(engine, ['list', '--json']); } finally { cap.restore(); }
+    const parsed = JSON.parse(cap.logs.join('\n'));
+    expect(parsed.sources[0].archived).toBe(true);
+  });
+});

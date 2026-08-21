@@ -97,6 +97,7 @@ interface SourceListEntry {
   name: string;
   local_path: string | null;
   federated: boolean;
+  archived: boolean;
   page_count: number;
   last_sync_at: string | null;
 }
@@ -557,6 +558,7 @@ async function runList(engine: BrainEngine, args: string[]): Promise<void> {
       name: r.name,
       local_path: r.local_path,
       federated: isFederated(r.config),
+      archived: r.archived === true,
       page_count: pageCount,
       last_sync_at: r.last_sync_at ? new Date(r.last_sync_at).toISOString() : null,
     });
@@ -576,8 +578,10 @@ async function runList(engine: BrainEngine, args: string[]): Promise<void> {
     // source's reads in both directions; an absent key ('unset') only keeps
     // it out of OTHER anchors' reads — its own unqualified reads still widen
     // outward (see sourceFederationState). Collapsing both to "isolated"
-    // overstates what an unset flag does.
-    const fedMark = (e as any).archived ? '⚠ archived' : sourceFederationState(rows[i].config);
+    // overstates what an unset flag does. Archived wins the marker: a
+    // soft-deleted source is purge-eligible after its 72h grace window,
+    // which matters more than its federation flag.
+    const fedMark = e.archived ? '⚠ archived' : sourceFederationState(rows[i].config);
     const pathStr = e.local_path ?? '(no local path)';
     const sync = e.last_sync_at ? `last sync ${e.last_sync_at}` : 'never synced';
     console.log(`  ${e.id.padEnd(20)}  ${fedMark.padEnd(12)}  ${String(e.page_count).padStart(6)} pages  ${sync}`);
@@ -1064,13 +1068,28 @@ async function runStatus(engine: BrainEngine, args: string[]): Promise<void> {
     }),
   );
 
+  // Archived sources are excluded from the health table (they're soft-deleted)
+  // but must never be INVISIBLE: an archived source is purge-eligible after its
+  // 72h grace window, and monitoring that reads status (e.g. flush-doctor's
+  // routing check) would otherwise report it as missing entirely — the exact
+  // failure mode that nearly purged an active 44-page source on 2026-08-21.
+  const archivedRows = await listArchivedSources(engine);
+
   if (json) {
     const enriched = metrics.map((m) => ({
       ...m,
       sync_running: syncRunning.has(m.source_id),
       sync_holder: syncRunning.get(m.source_id) ?? null,
     }));
-    console.log(JSON.stringify({ schema_version: 1, sources: enriched }, null, 2));
+    console.log(JSON.stringify({
+      schema_version: 1,
+      sources: enriched,
+      archived_sources: archivedRows.map((a) => ({
+        id: a.id,
+        page_count: a.pageCount,
+        expires_at: a.expiresAt.toISOString(),
+      })),
+    }, null, 2));
     return;
   }
 
@@ -1119,6 +1138,13 @@ async function runStatus(engine: BrainEngine, args: string[]): Promise<void> {
     if (warns.length > 0) {
       console.log(`  ⚠ ${m.source_id}: ${warns.join('; ')}`);
     }
+  }
+  for (const a of archivedRows) {
+    const hours = Math.max(0, Math.round((a.expiresAt.getTime() - Date.now()) / (1000 * 60 * 60)));
+    console.log(
+      `  ⚠ ${a.id}: ARCHIVED (${a.pageCount} pages, purge-eligible in ${hours}h) — ` +
+      `\`gbrain sources restore ${a.id}\` to keep it`,
+    );
   }
 }
 

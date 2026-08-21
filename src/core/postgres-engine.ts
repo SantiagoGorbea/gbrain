@@ -2776,9 +2776,6 @@ export class PostgresEngine implements BrainEngine {
     // later text rewrite that keeps the vector is detectable as content
     // drift (invalidateContentDriftEmbeddings). NULL when no embedding lands.
     const cols = `(page_id, chunk_index, chunk_text, chunk_source, ${writeColId}, model, token_count, embedded_at, embedded_text_hash, language, symbol_name, symbol_type, start_line, end_line, parent_symbol_path, doc_comment, symbol_name_qualified, modality, embedding_image)`;
-    const rows: string[] = [];
-    const params: unknown[] = [];
-    let paramIdx = 1;
 
     // Provenance fallback for chunks that don't carry an explicit `model`:
     // resolve the model the gateway ACTUALLY uses at runtime, not the
@@ -2813,7 +2810,24 @@ export class PostgresEngine implements BrainEngine {
     }
     if (!resolvedModel) resolvedModel = DEFAULT_EMBEDDING_MODEL;
 
-    for (const chunk of chunks) {
+    // 2026-08-21 wire-frame corruption workaround: a single-statement upsert
+    // of a many-chunk page binds N × ~12KB vector text literals into one
+    // several-hundred-KB extended-protocol frame, which under bun+postgres
+    // INTERMITTENTLY reaches the server with a corrupted parameter — Postgres
+    // rejects with `invalid byte sequence for encoding "UTF8": 0x00` while
+    // every parameter is verifiably NUL-free on the JS side (GBRAIN_DEBUG_STACK
+    // param dump). Whether the frame crosses the corruption zone depends on
+    // the connection's prior traffic, which is why the same content fails one
+    // run and imports the next. Batching bounds the frame size well below the
+    // zone; semantics are unchanged (same tx, same ON CONFLICT per batch).
+    const CHUNK_INSERT_BATCH = 8;
+    for (let batchStart = 0; batchStart < chunks.length; batchStart += CHUNK_INSERT_BATCH) {
+    const batch = chunks.slice(batchStart, batchStart + CHUNK_INSERT_BATCH);
+    const rows: string[] = [];
+    const params: unknown[] = [];
+    let paramIdx = 1;
+
+    for (const chunk of batch) {
       const embeddingStr = chunk.embedding
         ? '[' + Array.from(chunk.embedding).join(',') + ']'
         : null;
@@ -2934,6 +2948,7 @@ export class PostgresEngine implements BrainEngine {
          embedding_image = COALESCE(EXCLUDED.embedding_image, content_chunks.embedding_image)`,
       params as Parameters<typeof sql.unsafe>[1],
     );
+    }
   }
 
   async getChunks(slug: string, opts?: { sourceId?: string; sourceIds?: string[]; includeEmbedding?: boolean }): Promise<Chunk[]> {

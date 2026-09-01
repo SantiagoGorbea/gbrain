@@ -319,6 +319,10 @@ async function runLinksTimelinePass(
 
   const resolver = makeResolver(engine, { mode: 'batch', sourceId });
   const globalBasename = await isGlobalBasenameEnabled(engine);
+  // #3190: pack-aware verbs — the sweep must type edges the same way the
+  // extract command does or reconciliation flip-flops the link_type.
+  const { loadActivePackForLocalEngine } = await import('./schema-pack/best-effort.ts');
+  const pack = (await loadActivePackForLocalEngine(engine))?.manifest ?? null;
 
   type Extracted = Awaited<ReturnType<typeof extractPageLinks>>;
 
@@ -345,7 +349,7 @@ async function runLinksTimelinePass(
       // (frontmatter backfill stays a migration-orchestrator concern).
       const extracted = await extractPageLinks(
         slug, fullContent, page.frontmatter, page.type, resolver,
-        { skipFrontmatter: true, globalBasename },
+        { skipFrontmatter: true, globalBasename, pack },
       );
       if (extracted.candidates.length > 0) {
         pageCandidates.push({ slug, candidates: extracted.candidates });
@@ -355,10 +359,12 @@ async function runLinksTimelinePass(
     if (timelineEnabled) {
       for (const entry of parseTimelineEntries(fullContent)) {
         // Same row shape as extractTimelineFromDB's batch push (extract.ts):
-        // no explicit source (engine default applies), detail '' when empty.
+        // #3957 — parsed source label threaded so FS- and DB-extracted rows
+        // share one dedup shape; detail '' when empty.
         tlBatch.push({
           slug,
           date: entry.date,
+          source: entry.source,
           summary: entry.summary,
           detail: entry.detail || '',
           source_id: sourceId,
@@ -387,10 +393,21 @@ async function runLinksTimelinePass(
       }
     }
     const { allSlugs, slugToSources } = await lookupRefsForSlugs(engine, [...needed]);
+    // #3478: the 'default' fallback is a federation feature — a sweep over an
+    // isolated source must not push cross-source edges. Single-row fetchSource
+    // (not loadAllSources) keeps the sweep's bounded-cost discipline; a missing
+    // sources row fails closed to isolated.
+    const { fetchSource, isSourceFederated } = await import('./sources-load.ts');
+    const sourceRow = await fetchSource(engine, sourceId);
+    const allowCrossSource = sourceRow !== null && isSourceFederated(sourceRow.config);
     for (const { slug, candidates } of pageCandidates) {
       for (const c of candidates) {
-        const resolved = resolveCandidateSources(c, slug, sourceId, allSlugs, slugToSources);
-        if (!resolved) continue;
+        // #2589: a cross_source drop here means the target exists only in
+        // other sources and cross-source links are off — the sweep skips it
+        // exactly like the extract paths do (extract.ts counts these; the
+        // sweep has no drop ledger).
+        const resolved = resolveCandidateSources(c, slug, sourceId, allSlugs, slugToSources, allowCrossSource);
+        if (!resolved.ok) continue;
         linkBatch.push({
           from_slug: resolved.fromSlug,
           to_slug: c.targetSlug,

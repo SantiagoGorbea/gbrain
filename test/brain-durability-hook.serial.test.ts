@@ -10,6 +10,7 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { execFileSync } from 'child_process';
 import { hardenBrainRepo, unhardenBrainRepo } from '../src/core/brain-repo-durability.ts';
+import { crontabAvailable } from './helpers/fs-perms.ts';
 import { runPull } from '../src/commands/sources-harden.ts';
 
 // #2943 root cause: `env: process.env` is REQUIRED here. Bun snapshots
@@ -48,23 +49,16 @@ async function waitForOrigin(bare: string, expectSha: string, ms = 30_000): Prom
   return false;
 }
 
-/** #2943 (index.lock form): hardenBrainRepo installs the post-commit hook
- * BEFORE committing the scaffolding, so that commit fires the hook and
- * detaches a background brain_push. If that push loses the ref race against
- * hardenBrainRepo's own synchronous push, it falls back to `git pull
- * --rebase`, which takes .git/index.lock — racing the test body's first git
- * calls ("Unable to create '.../.git/index.lock': File exists"). Wait for the
- * detached push's terminal log line before handing the repo to the test. */
-async function waitForHookPushSettled(ms = 30_000): Promise<void> {
-  const log = join(process.env.HOME!, '.gbrain', 'brain-push.log');
-  const terminal = /\[push\] (ok|lock-timeout|LOCAL-ONLY)/;
-  const deadline = Date.now() + ms;
-  while (Date.now() < deadline) {
-    if (existsSync(log) && terminal.test(readFileSync(log, 'utf-8'))) return;
-    await new Promise(r => setTimeout(r, 150));
-  }
-  throw new Error(`detached hook push did not settle within ${ms}ms (${log})`);
-}
+// #2943 historical note: hardenBrainRepo installs the post-commit hook BEFORE
+// committing the scaffolding, and the scaffolding commit used to fire it —
+// detaching a background brain_push that raced hardenBrainRepo's own
+// synchronous push on the same ref (cannot-lock-ref; the loser's `pull
+// --rebase` then took .git/index.lock, racing the test body's first git
+// calls). This file used to park in a waitForHookPushSettled() poll after
+// every harden to let that race drain. #3925 removed the race at the source:
+// commitScaffolding commits with core.hooksPath=/dev/null, so the explicit
+// fail-loud push is the ONLY push and there is nothing to wait for. The
+// regression test below pins that.
 
 let root: string, work: string, bare: string;
 let oldHome: string | undefined, oldGbrainHome: string | undefined;
@@ -87,7 +81,6 @@ beforeEach(async () => {
   git(work, 'add', 'README.md'); git(work, 'commit', '-qm', 'init'); git(work, 'push', '-q', 'origin', 'main');
   git(work, 'remote', 'set-head', 'origin', 'main');
   await hardenBrainRepo({ repoPath: work, sourceId: 'wiki', pat: 'ghp_x', installCron: false });
-  await waitForHookPushSettled();
 });
 afterEach(() => {
   if (oldHome === undefined) delete process.env.HOME; else process.env.HOME = oldHome;
@@ -165,6 +158,22 @@ describe('brain-commit-push.sh (D13 guarantee)', () => {
 });
 
 describe('post-commit hook (D9 local, D7 self-contained)', () => {
+  test('#3925 — the scaffolding commit does NOT fire the hook (no racing background push)', async () => {
+    // beforeEach ran hardenBrainRepo. commitScaffolding commits with
+    // core.hooksPath=/dev/null, so its explicit fail-loud push is the ONLY
+    // push. Pre-fix, the commit fired the just-installed post-commit hook,
+    // detaching a background brain_push that raced the explicit push on the
+    // same ref (the #2943 cannot-lock-ref / index.lock flake class).
+    // The explicit push landed the scaffolding commit:
+    expect(originHead(bare)).toBe(git(work, 'rev-parse', 'HEAD'));
+    // ...and the hook never fired during harden: give a would-be detached
+    // push ample time to write its brain-push.log line, then assert silence.
+    await new Promise(r => setTimeout(r, 2_000));
+    const log = join(process.env.HOME!, '.gbrain', 'brain-push.log');
+    const lines = existsSync(log) ? readFileSync(log, 'utf-8') : '';
+    expect(lines).not.toMatch(/\[push\]/);
+  }, 60_000);
+
   test('a direct commit auto-pushes in the background', async () => {
     writeFileSync(join(work, 'note.md'), 'note\n');
     git(work, 'add', 'note.md'); git(work, 'commit', '-qm', 'note'); // fires .git/hooks/post-commit
@@ -201,7 +210,10 @@ describe('post-commit hook (D9 local, D7 self-contained)', () => {
 // then invokes that exact command to prove it performs a real pull. It always
 // unregisters the launchd/cron job afterward so no scheduled job survives.
 describe('durability schedule (installCron:true) [D2/D12]', () => {
-  test('registers the DB-free pull job with the right command + interval, and the job performs a real pull', async () => {
+  // skipIf: needs a real crontab/launchctl to register against — on hosts
+  // without one (some sandboxes) hardenBrainRepo correctly degrades the cron
+  // step to 'skipped', which is the product working, not this arc.
+  test.skipIf(!crontabAvailable() && process.platform !== 'darwin')('registers the DB-free pull job with the right command + interval, and the job performs a real pull', async () => {
     const sourceId = 'wiki';
     const report = await hardenBrainRepo({
       repoPath: work, sourceId, pat: 'ghp_x', installCron: true, intervalSec: 900, verify: false,

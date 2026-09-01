@@ -360,7 +360,7 @@ describe('sources list archived marker', () => {
     const { engine } = makeStub({
       [SELECT_ROWS]: [
         { id: 'arch', name: 'arch', local_path: '/tmp/a', last_commit: null, last_sync_at: null, config: '{"federated":true}', created_at: new Date(), archived: true },
-        { id: 'live', name: 'live', local_path: '/tmp/l', last_commit: null, last_sync_at: null, config: '{}', created_at: new Date(), archived: false },
+        { id: 'live', name: 'live', local_path: '/tmp/l', last_commit: null, last_sync_at: null, config: '{"federated":false}', created_at: new Date(), archived: false },
       ],
       'COUNT(*)::int AS n FROM pages': [{ n: 3 }],
     });

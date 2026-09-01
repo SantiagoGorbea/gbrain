@@ -860,6 +860,8 @@ describe('importFromContent type round-trip (#1035)', () => {
     ].join('\n'), { noEmbed: true });
     expect(result.status).toBe('imported');
     expect(putType).toBe('person'); // /people/ path-prefix inference intact
+  });
+});
 
 // ── U+0000 guard (2026-08-21) ───────────────────────────────
 // Postgres can never store a NUL in text/jsonb; a stray U+0000 anywhere in

@@ -26,6 +26,7 @@ import { forgetFactInFence } from '../src/core/facts/forget.ts';
 import { readRecentStubGuardEvents } from '../src/core/facts/stub-guard-audit.ts';
 import { writeSingleFact, isNullLikeEntity } from '../src/core/facts/write-single.ts';
 import { _resetWriteThroughCacheForTest } from '../src/core/write-through.ts';
+import { importFromContent } from '../src/core/import-file.ts';
 import { resetGateway } from '../src/core/ai/gateway.ts';
 import { withEnv } from './helpers/with-env.ts';
 
@@ -43,6 +44,7 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
+  await engine.executeRaw('DELETE FROM fact_withdrawals');
   // Fresh tempdir per test so the fence-write FS state is hermetic.
   brainDir = mkdtempSync(join(tmpdir(), 'fence-write-test-'));
   _resetWriteThroughCacheForTest();
@@ -181,6 +183,34 @@ describe('writeFactsToFence — happy path', () => {
     expect(body).toContain('Founded Widgets Inc.');
   });
 
+  test('#4872 mirrors the rewritten file into pages.compiled_truth; the next sync re-chunks the new row', async () => {
+    const filePath = join(brainDir, 'people/bob.md');
+    mkdirSync(join(brainDir, 'people'), { recursive: true });
+    const file = '---\ntype: person\ntitle: Bob\nslug: people/bob\n---\n\n# Bob\n\nMet at YC W22.\n';
+    writeFileSync(filePath, file, 'utf-8');
+    expect((await importFromContent(engine, 'people/bob', file, { noEmbed: true, sourceId: 'default' })).status).toBe('imported');
+
+    const result = await writeFactsToFence(
+      engine,
+      { sourceId: 'default', localPath: brainDir, slug: 'people/bob', resolutionSource: 'exact_page' },
+      [baseInput({ fact: 'Founded Widgets Inc.' })],
+    );
+    expect(result.inserted).toBe(1);
+
+    // The DB body get_page / the reconcile read must carry the row remember
+    // just reported stored — otherwise a get→put round-trip flattens it away.
+    const page = await engine.getPage('people/bob', { sourceId: 'default' });
+    expect(page!.compiled_truth).toContain('Founded Widgets Inc.');
+    expect(page!.compiled_truth).toContain('Met at YC W22.');
+    // The mirror is body-only (content_chunks untouched), so it must NOT
+    // claim the importer's hash: the next sync has to see the file as changed
+    // and re-chunk, or search never indexes the remembered row (wave review).
+    const imp = await importFromContent(engine, 'people/bob', readFileSync(filePath, 'utf-8'), { noEmbed: true, sourceId: 'default' });
+    expect(imp.status).toBe('imported');
+    const chunks = await engine.getChunks('people/bob', { sourceId: 'default', requireSafeChunks: true });
+    expect(chunks.map((c) => c.chunk_text).join('\n')).toContain('Founded Widgets Inc.');
+  });
+
   test('multi-fact batch appends consecutive row_nums', async () => {
     const result = await writeFactsToFence(
       engine,
@@ -256,6 +286,49 @@ describe('writeFactsToFence — happy path', () => {
     expect(git(brainDir, 'status', '--porcelain', 'people/durable.md')).toBe('');
     expect(git(brainDir, 'status', '--porcelain', 'seed.md')).not.toBe('');
   }, 60_000);
+});
+
+describe('writeFactsToFence — withdrawn claims (write-path audit B-10)', () => {
+  test('never appends a withdrawn claim, or a punctuation variant of it, as an active Markdown row', async () => {
+    await engine.executeRaw(`INSERT INTO fact_withdrawals(source_id,visibility,subject,fact_hash)
+      VALUES ('default','world','people/alice',gbrain_fact_fingerprint('Founded Acme in 2017'))`);
+    const result = await writeFactsToFence(
+      engine,
+      { sourceId: 'default', localPath: brainDir, slug: 'people/alice', resolutionSource: 'exact_page' },
+      [baseInput(), baseInput({ fact: 'founded Acme, in 2017.' }), baseInput({ fact: 'Moved to Lisbon in 2020' })],
+    );
+    expect(result.withdrawnSkipped).toBe(2);
+    expect(result.inserted).toBe(1);
+    const body = readFileSync(join(brainDir, 'people/alice.md'), 'utf-8');
+    expect(body).not.toContain('Acme');
+    expect(body).toContain('Moved to Lisbon in 2020');
+    expect(await engine.executeRaw(`SELECT fact FROM facts WHERE entity_slug='people/alice' ORDER BY id`))
+      .toEqual([{ fact: 'Moved to Lisbon in 2020' }]);
+  });
+
+  test('a claim withdrawn for another entity is still written for this one', async () => {
+    await engine.executeRaw(`INSERT INTO fact_withdrawals(source_id,visibility,subject,fact_hash)
+      VALUES ('default','world','people/bob',gbrain_fact_fingerprint('Founded Acme in 2017'))`);
+    const result = await writeFactsToFence(
+      engine,
+      { sourceId: 'default', localPath: brainDir, slug: 'people/alice', resolutionSource: 'exact_page' },
+      [baseInput()],
+    );
+    expect(result).toMatchObject({ inserted: 1 });
+    expect(result.withdrawnSkipped).toBeUndefined();
+  });
+
+  test('an entirely withdrawn batch leaves the filesystem untouched', async () => {
+    await engine.executeRaw(`INSERT INTO fact_withdrawals(source_id,visibility,subject,fact_hash)
+      VALUES ('default','world','*',gbrain_fact_fingerprint('Founded Acme in 2017'))`);
+    const result = await writeFactsToFence(
+      engine,
+      { sourceId: 'default', localPath: brainDir, slug: 'people/carol', resolutionSource: 'exact_page' },
+      [baseInput()],
+    );
+    expect(result).toEqual({ inserted: 0, ids: [], withdrawnSkipped: 1 });
+    expect(existsSync(join(brainDir, 'people/carol.md'))).toBe(false);
+  });
 });
 
 describe('writeFactsToFence — legacy fallback', () => {
@@ -893,4 +966,24 @@ afterAll(() => {
   } catch {
     /* best-effort */
   }
+});
+
+describe('writeFactsToFence — DB-body mirror never persists an empty content_hash (wave review)', () => {
+  test('a page row with no content_hash gets a non-empty one from the mirror', async () => {
+    const target = { sourceId: 'default', localPath: brainDir, slug: 'people/hashless', resolutionSource: 'exact_page' as const };
+    await writeFactsToFence(engine, target, [baseInput()]);
+    // The fence writer only stub-creates the FILE; sync creates the row. Import
+    // it, then drop the hash to model a row that lost it.
+    const stub = readFileSync(join(brainDir, 'people/hashless.md'), 'utf-8');
+    await importFromContent(engine, 'people/hashless', stub, { noEmbed: true, sourceId: 'default' });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (engine as any).db.query(`UPDATE pages SET content_hash = NULL WHERE slug = 'people/hashless'`);
+
+    const r = await writeFactsToFence(engine, target, [baseInput({ fact: 'Raised a seed round' })]);
+    expect(r.inserted).toBe(1);
+    const page = await engine.getPage('people/hashless', { sourceId: 'default' });
+    expect(page?.compiled_truth).toContain('Raised a seed round');
+    expect(typeof page?.content_hash).toBe('string');
+    expect(page!.content_hash!.length).toBeGreaterThan(0);
+  });
 });

@@ -14,7 +14,7 @@
  * Normalizer `doctor-json-v1`: ordered checks (name, status, message,
  * details, issues) plus the report envelope, with volatile tokens replaced:
  * temp home / repo / os tmpdir paths, UUIDs, ISO timestamps, the running
- * package version, the machine hostname, and `*_ms` / elapsed / pid-style
+ * package and Bun versions, the machine hostname, and `*_ms` / elapsed / pid-style
  * detail keys. Check order is emitted order (deterministic; no Map/Set
  * iteration is re-sorted). stderr lines are kept (normalized) because the
  * early-stop paths announce themselves there.
@@ -81,6 +81,8 @@ export async function runGbrain(h: DoctorHome, args: string[], env: Record<strin
   for (const [k, v] of Object.entries(process.env)) if (v !== undefined) childEnv[k] = v;
   for (const k of PROVIDER_ENV_KEYS) delete childEnv[k];
   for (const k of ['DATABASE_URL', 'GBRAIN_DATABASE_URL', 'GBRAIN_REMOTE_CLIENT_SECRET', 'GBRAIN_PGLITE_SNAPSHOT', 'GBRAIN_SKILLS_DIR', 'OPENCLAW_WORKSPACE']) delete childEnv[k];
+  // harness_wiring reads agent markers and harness config homes: keep the golden independent of the host's harness.
+  for (const k of ['CLAUDECODE', 'CLAUDE_CODE_ENTRYPOINT', 'CODEX_SANDBOX', 'CODEX_CI', 'CODEX_HOME', 'OPENCODE', 'OPENCODE_PID', 'XDG_CONFIG_HOME']) delete childEnv[k];
   Object.assign(childEnv, {
     HOME: h.home,
     GBRAIN_HOME: h.home,
@@ -138,6 +140,7 @@ export function normalizeDoctorText(text: string, roots: Record<string, string>,
   out = scrubTimestamps(out).replace(UUID, '<uuid>');
   out = out.replace(/\(most recent caller: at [^()]*\([^()]*\)\)/g, '(most recent caller: <frame>)');
   out = out.split(PACKAGE_VERSION).join('<version>');
+  out = out.split(`Bun ${Bun.version}`).join('Bun <bun-version>');
   const host = hostname();
   if (host) out = out.split(host).join('<hostname>');
   return out;

@@ -1,7 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { randomUUID } from 'node:crypto';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
-import { PostgresEngine } from '../src/core/postgres-engine.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 import type { OperationContext } from '../src/core/ops/contract.ts';
 import { operationsByName } from '../src/core/operations.ts';
@@ -9,6 +8,7 @@ import { parseFactsFence, upsertFactRow } from '../src/core/facts-fence.ts';
 import { submitRememberMutation, submitForgetMutation, prepareMemoryMutation } from '../src/core/persistence/memory-mutations.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
+import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
 import { registerLocalWriter } from '../src/core/persistence/identity.ts';
 import { submissionAuthority } from '../src/core/persistence/authority.ts';
 import { admitWrite, claimNextWrite, getWriteRequest, getWriteRequestById, receiptFor } from '../src/core/persistence/journal.ts';
@@ -17,9 +17,10 @@ import { waitFor } from './helpers/wait-for.ts';
 import { publishMutation } from '../src/core/persistence/coordinator.ts';
 import { configureGateway, resetGateway, __setEmbedTransportForTests } from '../src/core/ai/gateway.ts';
 import { LEGACY_EMBEDDING_CONFIG } from './helpers/legacy-embedding-config.ts';
-import { assertSafeE2eDatabaseUrl } from './helpers/db-guard.ts';
+import { isolatedPersistencePostgres } from './helpers/persistence-postgres.ts';
 
 const engines: BrainEngine[] = [];
+let closePostgres: (() => Promise<void>) | undefined;
 const sourceId = 'managed-memory-concurrency-test';
 const context = (engine: BrainEngine, remote = false): OperationContext => ({ engine, remote, sourceId,
   config: { engine: engine.kind }, dryRun: false, logger: { info() {}, warn() {}, error() {} } });
@@ -29,14 +30,13 @@ async function setupPage(engine: BrainEngine, slug: string, body = 'Existing bio
     await tx.putPage(slug, pageInput(body), { sourceId });
     await tx.addTag(slug, 'existing-tag', { sourceId });
     return (await tx.readPageSnapshot(slug, { sourceId }))!;
-  }));
+  }, TEST_WRITE_ATTRIBUTION));
 }
 beforeAll(async () => {
   configureGateway({ ...LEGACY_EMBEDDING_CONFIG, env: {} });
   const lite = new PGLiteEngine(); await lite.connect({}); await lite.initSchema(); engines.push(lite);
   if (process.env.DATABASE_URL) {
-    assertSafeE2eDatabaseUrl(process.env.DATABASE_URL);
-    const pg = new PostgresEngine(); await pg.connect({ database_url: process.env.DATABASE_URL, poolSize: 4 }); await pg.initSchema(); engines.push(pg);
+    const pg = await isolatedPersistencePostgres(process.env.DATABASE_URL); engines.push(pg.engine); closePostgres = pg.close;
   }
   for (const engine of engines) {
     await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1');
@@ -53,6 +53,7 @@ afterAll(async () => {
     await engine.executeRaw('DELETE FROM sources WHERE id=$1', [sourceId]);
     await engine.disconnect();
   }
+  await closePostgres?.();
   resetGateway();
 });
 
@@ -143,7 +144,7 @@ describe('journaled memory publication, both engines', () => {
       await engine.transaction(tx => withCoordinatedWrite(tx, [sourceId], async () => {
         await tx.executeRaw('DELETE FROM facts WHERE id=$1', [Number(first.id)]);
         await tx.deletePage(slug, { sourceId });
-      }));
+      }, TEST_WRITE_ATTRIBUTION));
       const replay = await operationsByName.remember!.handler(context(engine), params);
       expect(replay).toEqual(first);
       await expect(operationsByName.remember!.handler(context(engine), { ...params, ttl: 'P30D' })).rejects.toMatchObject({ code: 'invalid_params', writeError: 'idempotency_conflict', protocolVersion: 1 });
@@ -209,6 +210,9 @@ describe('journaled memory publication, both engines', () => {
         const params = { fact: 'Left acme-example', provenance: 'test', entity: slug, request_id: randomUUID() };
         const next = await submitRememberMutation(context(engine, true), params, 30_000);
         expect(next.status).toBe('superseded');
+        await waitFor(async () => (await engine.executeRaw(`SELECT 1 FROM persistence_effects e JOIN persistence_requests r ON r.id=e.request_id
+          WHERE r.source_id=$1 AND r.slug=$2 AND e.state IN ('queued','running')`, [sourceId, slug])).length === 0,
+        { label: `${engine.kind}: ${slug} effects settled before the replay count` });
         const callsBeforeReplay = providerCalls;
         expect(await submitRememberMutation(context(engine, true), params)).toEqual(next);
         expect(providerCalls).toBe(callsBeforeReplay);
@@ -283,12 +287,14 @@ describe('journaled memory publication, both engines', () => {
       const snapshot = (await engine.readPageSnapshot(slug, { sourceId }))!;
       expect(snapshot.revision).not.toBe(before.revision);
       expect(parseFactsFence(snapshot.page.compiled_truth).facts.find(f => f.claim === 'Withdraw this unique memory')?.forgotten).toBe(true);
-      expect(await engine.getChunks(slug, { sourceId })).toEqual([]);
+      const chunks = (await engine.getChunks(slug, { sourceId })).map(chunk => chunk.chunk_text).join('\n');
+      expect(chunks).toContain('Existing biography');
+      expect(chunks).not.toContain('Withdraw this unique memory');
       const local = await registerLocalWriter(engine, 'cli');
       const request = (await getWriteRequest(engine, { kind: 'local_cli', id: local.id }, requestId))!;
       expect(request.worktree_id).toBeNull();
       expect(await engine.executeRaw('SELECT kind FROM persistence_effects WHERE request_id=$1::uuid', [request.id])).not.toHaveLength(0);
-      await engine.transaction(tx => withCoordinatedWrite(tx, [sourceId], () => tx.executeRaw('DELETE FROM facts WHERE id=$1', [Number(remembered.id)])));
+      await engine.transaction(tx => withCoordinatedWrite(tx, [sourceId], () => tx.executeRaw('DELETE FROM facts WHERE id=$1', [Number(remembered.id)]), TEST_WRITE_ATTRIBUTION));
       expect(await submitForgetMutation(context(engine), 'forget', params)).toEqual(forgotten);
       // The fixture's offline owner is synthetic. Durable effects otherwise
       // deliberately retain their worktree identity until reconciliation.
@@ -304,7 +310,7 @@ describe('journaled memory publication, both engines', () => {
       await disposePersistenceConsumer(engine);
       const slug = 'people/preparation-example';
       await setupPage(engine, slug);
-      const old = await engine.transaction(tx => withCoordinatedWrite(tx, [sourceId], () => tx.insertFact({ fact: 'Claim withdrawn during preparation', source: 'test', entity_slug: slug, visibility: 'world' }, { source_id: sourceId })));
+      const old = await engine.transaction(tx => withCoordinatedWrite(tx, [sourceId], () => tx.insertFact({ fact: 'Claim withdrawn during preparation', source: 'test', entity_slug: slug, visibility: 'world' }, { source_id: sourceId }), TEST_WRITE_ATTRIBUTION));
       const snapshot = (await engine.readPageSnapshot(slug, { sourceId }))!;
       const authority = await submissionAuthority(context(engine), 'remember', sourceId, snapshot.sourceIncarnation, slug);
       const p = { fact: 'Claim withdrawn during preparation', provenance: 'test', entity_slug: slug, visibility: 'world', fence: true,

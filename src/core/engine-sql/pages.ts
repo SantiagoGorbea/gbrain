@@ -343,9 +343,13 @@ export async function listPages(exec: ScopedRead, filters?: PageFilters): Promis
       // Exact only when the cursor carries the column's microseconds: callers
       // resume from `Page.updated_at_iso` (projected below), never from a JS
       // Date, which would re-select every row in the last row's millisecond.
-      ? sqlFragment`AND (p.updated_at > ${keyset.updatedAt}::timestamptz OR (p.updated_at = ${keyset.updatedAt}::timestamptz AND p.slug > ${keyset.slug}))`
+      // `::text::timestamptz`: a bare `::timestamptz` param is typed by the
+      // postgres.js driver, which serializes strings through a JS Date and
+      // truncates the cursor to milliseconds (re-selecting the whole
+      // millisecond; a >limit cluster inside one millisecond never drains).
+      ? sqlFragment`AND (p.updated_at > ${keyset.updatedAt}::text::timestamptz OR (p.updated_at = ${keyset.updatedAt}::text::timestamptz AND p.slug > ${keyset.slug}))`
       : updatedAfter
-        ? sqlFragment`AND p.updated_at > ${updatedAfter}::timestamptz`
+        ? sqlFragment`AND p.updated_at > ${updatedAfter}::text::timestamptz`
         : sqlFragment``;
     // slugPrefix uses the (source_id, slug) UNIQUE btree index for range scans.
     // Escape LIKE metacharacters so the user prefix is treated as a literal.
@@ -380,8 +384,12 @@ export async function listPages(exec: ScopedRead, filters?: PageFilters): Promis
     const sortKey = filters?.sort && PAGE_SORT_SQL[filters.sort] ? filters.sort : 'updated_desc';
     const orderBy = trustedSql(PAGE_SORT_SQL[sortKey]);
 
+    const columns = filters?.listColumnsOnly === true
+      ? sqlFragment`p.id, p.source_id, p.slug, p.type, p.page_kind, p.title, p.created_at, p.updated_at, p.deleted_at,
+          p.effective_date, p.effective_date_source, ''::text AS compiled_truth, ''::text AS timeline, '{}'::jsonb AS frontmatter`
+      : sqlFragment`p.*`;
       const { rows } = await exec.run(sqlFragment`
-        SELECT p.*, to_char(p.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at_iso FROM pages p
+        SELECT ${columns}, to_char(p.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at_iso FROM pages p
         ${tagJoin}
         WHERE 1=1 ${typeCondition} ${tagCondition} ${updatedCondition} ${slugCondition} ${sourceCondition} ${deletedCondition} ${privateCondition} ${effectiveAfterCondition} ${effectiveBeforeCondition}
         ORDER BY ${orderBy} LIMIT ${limit} OFFSET ${offset}
@@ -756,6 +764,15 @@ export async function getPageTimestamps(exec: LegacyUnscopedRead, slugs: string[
     return new Map(rows.map(r => [r.slug, new Date(r.ts as string)]));
   }
 
+/**
+ * `get_versions` columns. Explicit, so the write attribution columns on
+ * page_versions (who wrote and who archived each snapshot) never reach a
+ * plain `read` caller; trusted and admin callers get them through
+ * `get_write_attribution`'s resolver in `ops/attribution.ts`.
+ */
+const PAGE_VERSION_COLUMNS = trustedSql('pv.id, pv.page_id, pv.compiled_truth, pv.frontmatter, pv.snapshot_at, pv.knowledge_revision, '
+  + 'pv.timeline, pv.title, pv.type, pv.tags, pv.is_deleted, pv.source_path');
+
 export async function getVersions(
   exec: LegacyUnscopedRead,
   slug: string,
@@ -765,7 +782,7 @@ export async function getVersions(
       ? trustedSql(`AND ${privatePagesFilterFragment('p')} AND ${privateSnapshotFilterFragment('pv')}`) : sqlFragment``;
     if (opts?.sourceIds && opts.sourceIds.length > 0) {
       const { rows } = await exec.run<PageVersion>(sqlFragment`
-        SELECT pv.* FROM page_versions pv
+        SELECT ${PAGE_VERSION_COLUMNS} FROM page_versions pv
         JOIN pages p ON p.id = pv.page_id
         WHERE p.slug = ${slug} AND p.source_id = ANY(${opts.sourceIds}::text[])
           ${privacy}
@@ -775,7 +792,7 @@ export async function getVersions(
     }
     if (opts?.sourceId) {
       const { rows } = await exec.run<PageVersion>(sqlFragment`
-        SELECT pv.* FROM page_versions pv
+        SELECT ${PAGE_VERSION_COLUMNS} FROM page_versions pv
         JOIN pages p ON p.id = pv.page_id
         WHERE p.slug = ${slug} AND p.source_id = ${opts.sourceId}
           ${privacy}
@@ -784,7 +801,7 @@ export async function getVersions(
       return rows;
     }
     const { rows } = await exec.run<PageVersion>(sqlFragment`
-      SELECT pv.* FROM page_versions pv
+      SELECT ${PAGE_VERSION_COLUMNS} FROM page_versions pv
       JOIN pages p ON p.id = pv.page_id
       WHERE p.slug = ${slug}
         ${privacy}
@@ -846,7 +863,11 @@ export async function updateSlug(exec: SqlExecutor, tx: BrainEngine, oldSlug: st
       return moved.length;
   }
 
-/** Replace a page's alias set under its page-key lock, inside the engine's transaction. */
+/**
+ * Replace a page's frontmatter alias set under its page-key lock, inside the
+ * engine's transaction. Derived rows (`origin` declared/subject, written by
+ * the mention pass) are left alone.
+ */
 export async function setPageAliases(
   exec: SqlExecutor,
   tx: Pick<BrainEngine, 'lockPageKeys'>,
@@ -856,7 +877,7 @@ export async function setPageAliases(
 ): Promise<void> {
     const uniq = Array.from(new Set(aliasNorms.filter(a => a.length > 0)));
       await tx.lockPageKeys([{ sourceId, slug }]);
-      await exec.executeRaw('DELETE FROM page_aliases WHERE source_id=$1 AND slug=$2', [sourceId, slug]);
+      await exec.executeRaw("DELETE FROM page_aliases WHERE source_id=$1 AND slug=$2 AND origin='frontmatter'", [sourceId, slug]);
       if (!uniq.length) return;
       await exec.executeRaw(`INSERT INTO page_aliases (source_id,alias_norm,slug)
         SELECT $1,a,$2 FROM unnest($3::text[]) AS a ON CONFLICT DO NOTHING`, [sourceId, slug, uniq]);

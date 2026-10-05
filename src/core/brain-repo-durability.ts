@@ -393,6 +393,11 @@ function gitDirPath(repoPath: string, rel: string): string {
   return join(repoPath, '.git', rel);
 }
 
+function pathContains(parent: string, child: string): boolean {
+  const rel = relative(parent, child);
+  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+}
+
 function resolveHooksDir(repoPath: string): { dir: string; tracked: boolean } {
   let hooksPath = '';
   try {
@@ -402,8 +407,10 @@ function resolveHooksDir(repoPath: string): { dir: string; tracked: boolean } {
   } catch { /* unset — normal */ }
   if (hooksPath) {
     const dir = isAbsolute(hooksPath) ? hooksPath : join(repoPath, hooksPath);
-    // A hooksPath outside .git/ (e.g. .githooks) is a TRACKED location.
-    const tracked = !dir.includes(`${join('.git', '')}`) && !dir.endsWith('.git/hooks');
+    // A hooksPath in the working tree but outside the git dir (e.g. .githooks)
+    // is a TRACKED location. Classify by path containment, never by a '.git'
+    // substring, which matches '.githooks' and checkouts like 'site.github.io'.
+    const tracked = pathContains(repoPath, dir) && !pathContains(gitDirPath(repoPath, ''), dir);
     return { dir, tracked };
   }
   return { dir: gitDirPath(repoPath, 'hooks'), tracked: false };
@@ -431,6 +438,7 @@ function installLocalHook(repoPath: string, dryRun: boolean): { status: StepStat
   if (existsSync(hookPath)) {
     const cur = readFileSync(hookPath, 'utf-8');
     if (cur.includes(HOOK_BANNER)) {
+      if (tracked && !dryRun) ensureExcluded(repoPath, relative(repoPath, hookPath));
       if (cur === script) return { status: 'ok', detail: `${relative(repoPath, hookPath)} already current` };
       if (dryRun) return { status: 'fixed', detail: `would refresh ${relative(repoPath, hookPath)} (dry-run)` };
       writeFileSync(hookPath, script); chmodSync(hookPath, 0o755);
@@ -501,9 +509,10 @@ export interface BoundedExecOptions {
 
 /**
  * `execFile` that settles within `timeout` or on abort even when the runtime
- * never delivers the child's exit or pipe close. Bun through 1.3.x drops
- * one-shot pidfd and pipe events when a callback re-enters the event loop
- * (bun:test `expect().resolves/.rejects`, oven-sh/bun#30301): execFile's
+ * never delivers the child's exit or pipe close. Bun drops one-shot pipe
+ * events (and, before 1.3.14, pidfd exit events: oven-sh/bun#30301) when a
+ * callback re-enters the event loop (bun:test `expect().resolves/.rejects`;
+ * pipe loss still reproduces on 1.4.2): execFile's
  * callback and its own `timeout` then never fire and the child stays a zombie,
  * so the deadline and abort are enforced with our own timer.
  *

@@ -34,6 +34,9 @@ import { hasAnthropicKey } from '../ai/anthropic-key.ts';
 import { parseTemporalWindow } from './temporal-window.ts';
 import { resolveExcludePrivatePages } from '../search/private-visibility.ts';
 import { deliverEvidence, effectivePlan, resolveEvidencePlan, EVIDENCE_BLOCK_CHAR_CAP, THINK_RETURN_UNIT_CONFIG_KEY, type DeliveryMeta } from '../search/evidence-delivery.ts';
+import { startThinkDecide, thinkAbstainResult, type ThinkAbstention } from './decide.ts';
+import { classifyIntent } from './intent.ts';
+import { maintenanceTransaction } from '../persistence/attribution.ts';
 
 /** Anthropic Messages client interface — same shape used by subagent.ts so test stubs can be shared. */
 export interface ThinkLLMClient {
@@ -77,6 +80,8 @@ export interface RunThinkOpts {
    * default model path keeps its graceful-degrade behavior.
    */
   modelExplicit?: boolean;
+  /** `false` keeps the gateway client on `model` (no `chat_fallback_chain` hop); an explicit model always does. */
+  allowFallback?: boolean;
   /** Optional time window for temporal questions. */
   since?: string;
   until?: string;
@@ -204,6 +209,8 @@ export interface ThinkResult {
   usage?: { input_tokens: number; output_tokens: number } | null;
   /** Evidence delivery meta, present only when think.return_unit is not chunk. */
   evidence_delivery?: import('../search/evidence-delivery.ts').DeliveryMeta;
+  /** Gathered pages with the revision retrieved, for retrieval-feedback recording; the op layer strips it. */
+  feedback_evidence?: Array<{ source_id: string; slug: string; content_hash: string | null }>;
   /** Only set when --save was true and the caller persisted a synthesis page. */
   savedSlug?: string;
   /** Diagnostics for `--explain` callers (CLI surface for v0.29). */
@@ -215,6 +222,8 @@ export interface ThinkResult {
   };
   /** USD cost computed from `usage` + `canonicalLookup(modelUsed)`, when both are available. */
   cost_usd?: number;
+  /** System One S4 (on): the brain holds no evidence; synthesis was skipped (think/decide.ts). */
+  abstained?: ThinkAbstention;
 }
 
 const DEFAULT_MAX_OUTPUT_TOKENS = 4000;
@@ -443,17 +452,28 @@ async function persistCitations(
   engine: BrainEngine,
   synthesisPageId: number,
   citations: ParsedCitation[],
+  scope: { sourceId?: string; allowedSources?: string[] } = {},
 ): Promise<{ inserted: number; warnings: string[] }> {
   const warnings: string[] = [];
+  // #5426: the same slug can exist in several sources. Bind each citation to
+  // a page in the sources the synthesis drew from (preferring its own source),
+  // never to a same-slug page elsewhere in the brain. Unscoped only for an
+  // unscoped think.
+  const sources = scope.allowedSources?.length ? scope.allowedSources : scope.sourceId ? [scope.sourceId] : null;
   // Resolve unique slugs to page_ids
   const slugToPageId = new Map<string, number>();
   for (const c of citations) {
     if (c.row_num === null) continue;  // page-level, skip
     if (slugToPageId.has(c.page_slug)) continue;
-    const rows = await engine.executeRaw<{ id: number }>(
-      `SELECT id FROM pages WHERE slug = $1 LIMIT 1`,
-      [c.page_slug],
-    );
+    const rows = sources
+      ? await engine.executeRaw<{ id: number }>(
+        `SELECT id FROM pages WHERE slug = $1 AND source_id = ANY($2::text[]) ORDER BY (source_id = $3) DESC, id LIMIT 1`,
+        [c.page_slug, sources, scope.sourceId ?? ''],
+      )
+      : await engine.executeRaw<{ id: number }>(
+        `SELECT id FROM pages WHERE slug = $1 LIMIT 1`,
+        [c.page_slug],
+      );
     if (rows[0]) slugToPageId.set(c.page_slug, rows[0].id);
   }
   const evidenceInputs: SynthesisEvidenceInput[] = [];
@@ -549,6 +569,7 @@ export async function runThink(
     }
   }
 
+  const thinkDecide = await startThinkDecide(engine, opts, classifyIntent(opts.question)).catch(() => undefined); // System One S2/S4; undefined when both are off
   // GATHER
   const gather = await runGather(engine, {
     question: opts.question,
@@ -560,14 +581,13 @@ export async function runThink(
     remote: opts.remote,
     ...(opts.sourceId !== undefined ? { sourceId: opts.sourceId } : {}),
     ...(opts.allowedSources !== undefined ? { sourceIds: opts.allowedSources } : {}),
+    ...(thinkDecide?.searchIntent ? { decideIntent: thinkDecide.searchIntent } : {}),
   });
   // D6: per-stream gather failures surface as typed codes (GATHER_*_FAILED);
   // raw error text stays on stderr. Distinguishes an errored stream from a
   // legitimately-empty one for MCP/remote callers.
   for (const w of gather.warnings) warnings.push(w);
-  if (gather.diagnostics.window?.dropped) {
-    warnings.push(`WINDOW_EXCLUDED_${gather.diagnostics.window.dropped}_PAGES`);
-  }
+  if (gather.diagnostics.window?.dropped) warnings.push(`WINDOW_EXCLUDED_${gather.diagnostics.window.dropped}_PAGES`);
 
   // Render evidence blocks for the prompt. #4510: the per-page excerpt is
   // budget-aware — 600 chars is the FLOOR (a big gather never collapses each
@@ -623,11 +643,9 @@ export async function runThink(
   let trajectoryPointsCount = 0;
   let trajectoryExcludedCount = 0;
   const trajectoryEnabledConfig = await readThinkTrajectoryEnabled(engine);
-  const trajectoryEnabledOpt = opts.withTrajectory !== false; // default true
-  if (trajectoryEnabledConfig && trajectoryEnabledOpt) {
+  if (trajectoryEnabledConfig && opts.withTrajectory !== false) { // opt defaults true
     try {
-      const { classifyIntent } = await import('./intent.ts');
-      const trajIntent = classifyIntent(opts.question);
+      const trajIntent = thinkDecide ? await thinkDecide.trajectoryIntent(classifyIntent(opts.question)) : classifyIntent(opts.question);
       if (trajIntent === 'temporal' || trajIntent === 'knowledge_update') {
         const { extractCandidateEntities } = await import('./entity-extract.ts');
         const retrievedSlugs = gather.pages.map(p => p.slug);
@@ -706,10 +724,11 @@ export async function runThink(
       process.stderr.write(`[think] trajectory injection failed: ${err instanceof Error ? err.message : String(err)}\n`);
     }
   }
-  if (trajectoryPointsCount > 0) {
-    warnings.push(`TRAJECTORY_INJECTED_${trajectoryPointsCount}_POINTS`);
-  }
+  if (trajectoryPointsCount > 0) warnings.push(`TRAJECTORY_INJECTED_${trajectoryPointsCount}_POINTS`);
   if (trajectoryExcludedCount > 0) warnings.push(`WINDOW_EXCLUDED_${trajectoryExcludedCount}_TRAJECTORY_POINTS`);
+
+  const abstention = await thinkDecide?.answerability({ pages: gather.pages, takes: gather.takes, trajectory: trajectoryBlock.length > 0 }).catch(() => null); // System One S4
+  if (abstention) return thinkAbstainResult(opts.question, gather, modelUsed, warnings, abstention);
 
   // SYNTHESIZE
   const intent = inferIntent(opts.question, opts.anchor);
@@ -759,7 +778,7 @@ export async function runThink(
     // That bypassed gateway config (gbrain config set anthropic_api_key)
     // because the Anthropic SDK only reads process.env.ANTHROPIC_API_KEY.
     // Closes #952 (think over MCP returns "no LLM available").
-    const client = opts.client ?? await tryBuildGatewayClient(modelUsed, { explicitModel: opts.modelExplicit });
+    const client = opts.client ?? await tryBuildGatewayClient(modelUsed, { explicitModel: opts.modelExplicit, allowFallback: opts.allowFallback });
     if (!client) {
       // Label the failure honestly: a missing key and an unusable model id are
       // different incidents with different fixes. Pre-fix EVERY null client was
@@ -945,6 +964,7 @@ export async function runThink(
     // ANDs the not-JSON/sentinel flag with a content check (catches valid-but-empty JSON).
     synthesisOk: synthesisOk && response.answer.trim().length > 0,
     synthesis_status: synthesisStatus,
+    feedback_evidence: gather.pages.map(pg => ({ source_id: pg.source_id ?? 'default', slug: pg.slug, content_hash: pg.content_hash ?? null })),
     ...(extractive ? { extractive } : {}),
     usage, ...(evidenceDelivery ? { evidence_delivery: evidenceDelivery } : {}),
     diagnostics: {
@@ -997,6 +1017,7 @@ export function stripGapsSection(answer: string): string {
 export async function persistSynthesis(
   engine: BrainEngine,
   result: ThinkResult,
+  scope: { sourceId?: string; allowedSources?: string[] } = {},
 ): Promise<{ slug: string; evidenceInserted: number; warnings: string[] }> {
   // #1698: never persist an empty synthesis. Returned signal (NOT a throw, F3) so
   // the MCP `think` op can return the gather result + warning instead of a bare error
@@ -1024,7 +1045,7 @@ export async function persistSynthesis(
     result.gaps.length > 0 ? '## Gaps\n\n' + result.gaps.map(g => `- ${g}`).join('\n') : '',
   ].filter(Boolean).join('\n');
 
-  const page = await engine.putPage(slug, {
+  const page = await maintenanceTransaction(engine, tx => tx.putPage(slug, {
     title: result.question.slice(0, 200),
     type: 'synthesis',
     compiled_truth: body,
@@ -1036,9 +1057,9 @@ export async function persistSynthesis(
       pages_gathered: result.pagesGathered,
       takes_gathered: result.takesGathered,
     },
-  });
+  }, scope.sourceId ? { sourceId: scope.sourceId } : undefined));
 
-  const persisted = await persistCitations(engine, page.id, result.citations);
+  const persisted = await persistCitations(engine, page.id, result.citations, scope);
   return { slug, evidenceInserted: persisted.inserted, warnings: persisted.warnings };
 }
 
@@ -1097,7 +1118,7 @@ async function readThinkTrajectoryEnabled(engine: BrainEngine): Promise<boolean>
  */
 async function tryBuildGatewayClient(
   modelUsed: string,
-  opts: { explicitModel?: boolean } = {},
+  opts: { explicitModel?: boolean; allowFallback?: boolean } = {},
 ): Promise<ThinkLLMClient | null> {
   // Normalize: ensure provider:model shape (and slash→colon — #1698). resolveModel
   // returns bare anthropic ids (`claude-opus-4-7`); gateway.chat needs `anthropic:...`.
@@ -1143,6 +1164,8 @@ async function tryBuildGatewayClient(
           system,
           messages,
           maxTokens: params.max_tokens,
+          // An explicit --model is a hard requirement (#1698), never a hop.
+          ...(opts.explicitModel || opts.allowFallback === false ? { allowFallback: false } : {}),
         });
       } catch (e) {
         // AIConfigError at chat time = e.g. key revoked mid-run. For an EXPLICIT

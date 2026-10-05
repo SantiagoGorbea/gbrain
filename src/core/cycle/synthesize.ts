@@ -1,5 +1,6 @@
 import { maintenancePreflight, publishMaintenancePage, type MaintenanceAuthority } from '../persistence/prepared-maintenance.ts';
-import { postprocessManagedSynthesis } from './synthesize-postprocess.ts';
+import { postprocessManagedSynthesis, withPublishPending } from './synthesize-postprocess.ts';
+import { acceptedPendingReceipt } from '../persistence/accepted-pending.ts';
 /**
  * Synthesize phase (v0.23; #4152 two-stage cascade) — conversation-to-brain
  * pipeline. Cheap-model triage gates frontier-model synthesis:
@@ -74,6 +75,7 @@ import { buildManifestContext, buildLinkManifest, type ManifestContext } from '.
 import { resolveCycleDate, utcDate } from './cycle-date.ts';
 import { throwIfAborted } from '../abort-check.ts';
 import { stampDreamProvenance } from './dream-provenance.ts';
+import { maintenanceTransaction } from '../persistence/attribution.ts';
 
 // Re-exports: the drain was peeled to inline-drain.ts (dream-wave C7), the
 // allow-list loader to filing-rules.ts (#2397); patterns.ts and the
@@ -81,7 +83,7 @@ import { stampDreamProvenance } from './dream-provenance.ts';
 export { runSubagentsInline, runDrainRenewalTick };
 import { loadAllowedSlugPrefixes } from './filing-rules.ts';
 export { loadAllowedSlugPrefixes };
-import { discoverTranscripts, DEFAULT_EXCLUDE_PATTERNS, type DiscoveredTranscript } from './transcript-discovery.ts';
+import { discoverTranscripts, DEFAULT_EXCLUDE_PATTERNS, type DiscoveredTranscript, conversationPagesOptedIn, conversationPagesNotConsumed, withConversationPages, withTranscriptSeats } from './transcript-discovery.ts';
 import { loadStorageConfig, isDbOnly } from '../storage-config.ts';
 import { serializeMarkdown, serializePageToMarkdown } from '../markdown.ts';
 import type { Page, PageType } from '../types.ts';
@@ -91,6 +93,8 @@ import { PAGE_SLUG_SEG } from '../cjk.ts';
 import { withChatPhase, estimateChatCostUsd } from '../ai/chat-usage.ts';
 import { verifyAndRepairDreamPages, normForGrounding, readVerifyEpoch, loadChildWriteEpochs, isDreamOwnedPage, type QuoteVerifyStats, type TranscriptForVerify } from './synthesize-verify.ts';
 import { dreamBreakerRefusal, loadDreamBreaker } from './dream-breaker.ts';
+import { resolveTriageDecide, type TriageDecide, type TriageDecideStats } from './triage-decide.ts';
+import { resolveGroundingDecide } from './grounding-decide.ts';
 import { passesTriageGate, rescueConfigOf, DEFAULT_RESCUE_FLOOR, DEFAULT_RESCUE_MIN_SEGMENTS, DEFAULT_RESCUE_CONTENT_TYPES, DEFAULT_RESCUE_CONFIG, type RescueConfig, type RescueVerdictLike } from './triage-rescue.ts';
 
 // Slug grammar from validatePageSlug — shared via PAGE_SLUG_SEG (#738).
@@ -342,6 +346,8 @@ export interface SynthesizePhaseOpts {
   to?: string;
   /** #4348: clock seam for deterministic cycle-date bucketing (tests). */
   now?: () => Date;
+  /** Test seam for the triage time budget; defaults to the real clock. */
+  triageNow?: () => number;
   /** C-15: the cycle's calendar date (runCycle resolves one per cycle); --date still wins. */
   cycleDate?: string;
   /** #4168 sibling: absolute wall-clock deadline (epoch ms) of the enclosing
@@ -441,9 +447,9 @@ async function runPhaseSynthesizeInner(
     config.subagentWaitTimeoutMs = clamped.waitTimeoutMs;
 
     // Allow ad-hoc --input to run even when config is disabled.
-    if (!opts.inputFile && !config.corpusDir) {
-      return skipped('not_configured',
-        'dream.synthesize.session_corpus_dir is unset');
+    if (!opts.inputFile && !config.corpusDir && !(await conversationPagesOptedIn(engine))) {
+      return await conversationPagesNotConsumed(engine, opts.sourceId ?? 'default')
+        ?? skipped('not_configured', 'dream.synthesize.session_corpus_dir is unset');
     }
     if (!opts.inputFile && !config.enabled) {
       if (!opts.once) {
@@ -473,7 +479,7 @@ async function runPhaseSynthesizeInner(
       );
     }
 
-    const maintenance = opts.dryRun ? null : await maintenancePreflight(engine, opts.sourceId ?? 'default', opts.brainDir);
+    const maintenance = opts.dryRun ? null : await maintenancePreflight(engine, opts.sourceId ?? 'default', opts.brainDir, { deadlineAtMs: opts.deadlineAtMs });
 
     // v0.32.6 M2: pre-fetch prior contradictions from the most recent probe
     // run (if any). Surfaced as an informational block to the synthesize
@@ -481,11 +487,11 @@ async function runPhaseSynthesizeInner(
     // them. Best-effort — a probe that's never run is a normal early state.
     const priorContradictionsBlock = await loadPriorContradictionsBlock(engine);
 
-    // Discover.
-    const transcripts = opts.inputFile
+    // Discover: the corpus walk (or --input) plus #4419 imported conversation pages.
+    const transcripts = await withConversationPages(engine, opts, config, opts.inputFile
       ? loadAdHocTranscript(opts.inputFile, config.minChars, config.excludePatterns, opts.bypassDreamGuard)
-      : discoverTranscripts({
-          corpusDir: config.corpusDir!,
+      : !config.corpusDir ? [] : discoverTranscripts({
+          corpusDir: config.corpusDir,
           meetingTranscriptsDir: config.meetingTranscriptsDir ?? undefined,
           minChars: config.minChars,
           excludePatterns: config.excludePatterns,
@@ -505,7 +511,7 @@ async function runPhaseSynthesizeInner(
               ].map(prefix => join(opts.brainDir, prefix)),
           // #5413: corpus files captured from gbrain's own claude-cli calls.
           selfCaptureSessionIds: claudeCliSelfSessionIds(),
-        });
+        }));
 
     if (transcripts.length === 0) {
       return ok('no transcripts to process', { transcripts_processed: 0, pages_written: 0 });
@@ -531,9 +537,9 @@ async function runPhaseSynthesizeInner(
       maxTokens: config.triage.maxTokens,
       threshold: config.triage.threshold,
       concurrency: config.triage.concurrency,
-      maxMs: config.triage.maxMs,
+      maxMs: config.triage.maxMs, now: opts.triageNow,
       signal: opts.signal,
-      rescue: rescueConfigOf(config.triage),
+      rescue: rescueConfigOf(config.triage), decide: await resolveTriageDecide(engine),
     }, opts.yieldDuringPhase);
     pass.reports.push(...transcripts.filter(t => retained.has(t.filePath)).map(t => ({ filePath: t.filePath,
       worth: true, score: null, content_type: null, cached: true, reasons: ['retained_completed_output'] })));
@@ -575,7 +581,7 @@ async function runPhaseSynthesizeInner(
       rescue_checked: pass.reports.filter(
         r => r.score !== null && r.score < config.triage.threshold && r.score >= config.triage.rescueFloor,
       ).length,
-      rescue_fired: pass.reports.filter(r => r.rescued === true).length,
+      rescue_fired: pass.reports.filter(r => r.rescued === true).length, ...(pass.decide ? { decide: pass.decide } : {}),
     };
     // 3A: a time-boxed cold pass must never read as mass rejection.
     const deferralSuffix = pass.deferred > 0
@@ -1130,7 +1136,7 @@ async function runPhaseSynthesizeInner(
     // rescued/passed transcript whose child declined to write (task D) is
     // distinguishable from a triage miss in the phase telemetry.
     const jobsWithPages = new Set<number>();
-    let writtenRefs = await collectChildPutPageSlugs(engine, childIds, chunkInfo, cycleSourceId, jobRawSource, jobsWithPages);
+    let writtenRefs = withTranscriptSeats(await collectChildPutPageSlugs(engine, childIds, chunkInfo, cycleSourceId, jobRawSource, jobsWithPages), worthProcessing);
     let finalizedRefs = writtenRefs;
 
     // Grounding gate: verify every page the children wrote (whole page when
@@ -1139,20 +1145,21 @@ async function runPhaseSynthesizeInner(
     // chunks or the markdown body. Fail-open (abort still unwinds); kill
     // switch: dream.synthesize.quote_verify=false.
     let quoteVerifyStats: QuoteVerifyStats | null = null;
+    let publishPending = 0;
     const sinceByTranscript = await loadChildWriteEpochs(engine, childIds, jobRawSource, verifySince);
+    const grounding = config.quoteVerify ? await resolveGroundingDecide(engine) : undefined;
     if (maintenance) {
       const processed = await postprocessManagedSynthesis(engine, maintenance, writtenRefs, childIds, jobRawSource,
-        worthProcessing, { cycleDate: summaryDate, quoteVerify: config.quoteVerify, sinceByTranscript, signal: opts.signal });
+        worthProcessing, { cycleDate: summaryDate, quoteVerify: config.quoteVerify, sinceByTranscript, signal: opts.signal, grounding });
       writtenRefs = processed.writtenRefs;
       finalizedRefs = processed.finalizedRefs;
+      publishPending = processed.pending;
       quoteVerifyStats = config.quoteVerify ? processed.stats : null;
     } else if (config.quoteVerify && writtenRefs.length > 0) {
-      const transcriptsForVerify = new Map<string, TranscriptForVerify>(
-        worthProcessing.map(t => [t.filePath, { content: t.content }]),
-      );
+      const transcriptsForVerify = new Map<string, TranscriptForVerify>(worthProcessing.map(t => [t.filePath, { content: t.content }]));
       try {
         quoteVerifyStats = await verifyAndRepairDreamPages(engine, writtenRefs, transcriptsForVerify,
-          { since: verifySince, sinceByTranscript, checkedAt: summaryDate, signal: opts.signal });
+          { since: verifySince, sinceByTranscript, checkedAt: summaryDate, signal: opts.signal, grounding });
       } catch (e) {
         throwIfAborted(opts.signal, '[dream] quote verify');
         process.stderr.write(`[dream] quote verify pass failed open: ${e instanceof Error ? e.message : String(e)}\n`);
@@ -1167,9 +1174,10 @@ async function runPhaseSynthesizeInner(
 
     const summarySlug = buildDreamSummarySlug(config.outputRoot, summaryDate);
     const writtenSlugs = writtenRefs.map(r => r.slug);
-    if (SUMMARY_SLUG_RE.test(summarySlug)) {
+    if (SUMMARY_SLUG_RE.test(summarySlug) && !publishPending) {
       const preserveSummary = maintenance && !writtenRefs.length && await engine.readPageSnapshot(summarySlug, { sourceId: cycleSourceId });
-      if (!preserveSummary) await writeSummaryPage(engine, opts.brainDir, summarySlug, summaryDate, finalizedRefs.map(r => r.slug), childOutcomes, cycleSourceId, opts.signal, maintenance);
+      if (!preserveSummary) await writeSummaryPage(engine, opts.brainDir, summarySlug, summaryDate, finalizedRefs.map(r => r.slug), childOutcomes, cycleSourceId, opts.signal, maintenance)
+        .catch((e: unknown) => { if (!acceptedPendingReceipt(e)) throw e; publishPending++; });
     }
 
     // #4077: nothing below runs for a cancelled cycle — no phase-end embed
@@ -1322,11 +1330,11 @@ async function runPhaseSynthesizeInner(
     // still-unknown keys) AND nothing was budget-deferred (#4168 adversarial:
     // "deferred transcripts retry next cycle" is a lie if the next cycle is
     // cooldown-skipped for half a day).
-    if (failedChildren.length === 0 && budgetExhaustedDeferrals.length === 0 && pass.deferred === 0) {
+    if (failedChildren.length === 0 && budgetExhaustedDeferrals.length === 0 && pass.deferred === 0 && publishPending === 0) {
       await engine.setConfig('dream.synthesize.last_completion_ts', new Date().toISOString());
     } else {
       process.stderr.write(
-        `[dream] synthesize: ${failedChildren.length}/${childOutcomes.length} child job(s) incomplete + ${budgetExhaustedDeferrals.length} synthesis-budget deferred + ${pass.deferred} triage-deferred — cooldown NOT stamped so the next run retries them.\n`,
+        `[dream] synthesize: ${failedChildren.length}/${childOutcomes.length} child job(s) incomplete + ${budgetExhaustedDeferrals.length} synthesis-budget deferred + ${pass.deferred} triage-deferred + ${publishPending} publish-deferred — cooldown NOT stamped so the next run retries them.\n`,
       );
     }
 
@@ -1340,7 +1348,7 @@ async function runPhaseSynthesizeInner(
     const turnsSamples = childOutcomes.filter(
       (o): o is { jobId: number; status: string; turns: number } => typeof o.turns === 'number',
     );
-    return ok(`${submittedTranscripts} transcript(s) synthesized in ${(ms / 1000).toFixed(1)}s${deferralSuffix}`, {
+    return withPublishPending(publishPending, ok(`${submittedTranscripts} transcript(s) synthesized in ${(ms / 1000).toFixed(1)}s${deferralSuffix}`, {
       transcripts_discovered: transcripts.length,
       transcripts_processed: submittedTranscripts,
       pages_written: writtenSlugs.length,
@@ -1401,11 +1409,12 @@ async function runPhaseSynthesizeInner(
         // F1b/F4b telemetry (null when the kill switch is off or nothing
         // was written).
         quote_verify: quoteVerifyStats,
+        ...(grounding ? { grounding: grounding.stats } : {}),
         // F6: phase spend, from the two authoritative sources (minion_jobs
         // child counters + triage pass usage). cost_usd null when unpriced.
         spend: spendBlock,
       },
-    });
+    }));
   } catch (e) {
     return failed(makeError('InternalError', 'SYNTH_PHASE_FAIL',
       e instanceof Error ? (e.message || 'synthesize phase threw') : String(e)));
@@ -1601,7 +1610,7 @@ export async function loadSynthConfig(engine: BrainEngine): Promise<SynthConfig>
   const corpusDir = await engine.getConfig('dream.synthesize.session_corpus_dir');
   // v2: enabled defaults to true when corpus dir is configured, false otherwise.
   // Explicit enabled=false still wins for pausing synthesis without removing corpus config.
-  const enabled = enabledRaw === 'false' ? false : (enabledRaw === 'true' || !!corpusDir);
+  const enabled = enabledRaw === 'false' ? false : (enabledRaw === 'true' || !!corpusDir || await conversationPagesOptedIn(engine));
   const meetingTranscriptsDir = await engine.getConfig('dream.synthesize.meeting_transcripts_dir');
   const excludeStr = await engine.getConfig('dream.synthesize.exclude_patterns');
   // v0.28: resolveModel() unifies CLI flag > new key > deprecated key > models.default > env > fallback
@@ -1932,6 +1941,8 @@ export function makeJudgeClient(verdictModel: string): JudgeClient | null {
         type: 'message',
         role: 'assistant',
         model: modelStr,
+        // A chat_fallback_chain entry answered: judgeSignificance marks the verdict uncacheable.
+        ...(result.fallbackFrom ? { answered_by: result.model } : {}),
         content: [{ type: 'text', text: result.text }],
         stop_reason: result.stopReason === 'length' ? 'max_tokens'
           : result.stopReason === 'tool_calls' ? 'tool_use'
@@ -1984,6 +1995,12 @@ export interface TriageResult {
    * the call was paid whether or not the verdict parsed.
    */
   tokens?: { in: number; out: number };
+  /**
+   * The model that answered when it is not the verdict model (a
+   * chat_fallback_chain hop). Its score is not comparable within the cache
+   * tuple, so runTriagePass uses the verdict for this run without caching it.
+   */
+  answeredBy?: string;
 }
 
 /** Degenerate TriageResult factory — score 0, never cached (unreliable is always set). */
@@ -2108,7 +2125,9 @@ Quote verbatim; never paraphrase inside "quote".`;
     && typeof rawUsage.output_tokens === 'number' && Number.isFinite(rawUsage.output_tokens)
     ? { in: rawUsage.input_tokens, out: rawUsage.output_tokens }
     : undefined;
-  const withTokens = (r: TriageResult): TriageResult => (callTokens ? { ...r, tokens: callTokens } : r);
+  const answeredBy = (msg as { answered_by?: string }).answered_by;
+  const withTokens = (r: TriageResult): TriageResult =>
+    ({ ...r, ...(callTokens ? { tokens: callTokens } : {}), ...(answeredBy ? { answeredBy } : {}) });
   const refused = stopReasonRaw === 'refusal';
   const abnormalStop: TriageResult['unreliable'] | undefined =
     truncated ? 'truncated' : refused ? 'refusal' : undefined;
@@ -2308,6 +2327,8 @@ export interface TriagePassCfg {
    * loadSynthConfig where available. minSegments 0 disables the band.
    */
   rescue?: RescueConfig;
+  /** System One S7 (triage-decide.ts); undefined when the slot is off. */
+  decide?: TriageDecide;
 }
 
 export interface TriageFileReport {
@@ -2342,6 +2363,8 @@ export interface TriagePassResult {
   deferred: number;
   /** F6: summed judge-call usage across cache MISSES this pass (hits are free). */
   tokens: { in: number; out: number };
+  /** S7 decide stats, present only when the slot is not off. */
+  decide?: TriageDecideStats;
 }
 
 /**
@@ -2416,9 +2439,25 @@ export async function runTriagePass(
   // one decision.
   const rescueCfg = cfg.rescue ?? DEFAULT_RESCUE_CONFIG;
   const gate = (v: RescueVerdictLike, content: string) =>
-    passesTriageGate(v, content, cfg.threshold, rescueCfg);
+    passesTriageGate(v, content, cfg.threshold, rescueCfg, cfg.decide?.gate);
 
   const processOne = async (idx: number): Promise<void> => {
+    const d = cfg.decide;
+    if (!d?.acting) { await processLlm(idx); if (d) await d.observe(transcripts[idx]); return; }
+    const t = transcripts[idx];
+    const r = await d.triage(t, { triageVersion: TRIAGE_VERSION, force: cfg.force, staleBefore: cfg.staleBefore, signal: cfg.signal, budgetExhausted });
+    if (!r.verdict) {
+      if (r.deferred || judge) return processLlm(idx);
+      reports[idx] = { filePath: t.filePath, worth: true, score: null, content_type: null, reasons: [r.reason ?? 'decide triage no-change'], cached: false };
+      return;
+    }
+    if (r.cached) cacheHits++;
+    else { judged++; if (cfg.shouldStop?.()) stopped = true; }
+    byPath.set(t.filePath, r.verdict);
+    reports[idx] = { filePath: t.filePath, worth: gate(r.verdict, t.content).pass, score: r.verdict.score, content_type: r.verdict.content_type, reasons: r.verdict.reasons, cached: r.cached === true };
+  };
+
+  const processLlm = async (idx: number): Promise<void> => {
     const t = transcripts[idx];
     // Cache lookup is always free — never deferred by the time budget.
     const cached = cfg.force ? null : await engine.getDreamVerdict(t.filePath, t.contentHash);
@@ -2512,16 +2551,20 @@ export async function runTriagePass(
       // #4077: a cancelled cycle must not bank new dream_verdicts rows for
       // work it is abandoning — the next run re-judges from a clean slate.
       throwIfAborted(cfg.signal, '[dream] significance judge');
-      await engine.putDreamVerdict(t.filePath, t.contentHash, {
-        worth_processing: triage.worth_processing,
-        reasons: triage.reasons,
-        score: triage.score,
-        content_type: triage.content_type,
-        segments: triage.segments,
-        entities: triage.entities,
-        model: cfg.model,
-        triage_version: TRIAGE_VERSION,
-      });
+      if (triage.answeredBy) {
+        process.stderr.write(`[dream] triage for ${t.basename} came from fallback model ${triage.answeredBy}; not caching in dream_verdicts\n`);
+      } else {
+        await engine.putDreamVerdict(t.filePath, t.contentHash, {
+          worth_processing: triage.worth_processing,
+          reasons: triage.reasons,
+          score: triage.score,
+          content_type: triage.content_type,
+          segments: triage.segments,
+          entities: triage.entities,
+          model: cfg.model,
+          triage_version: TRIAGE_VERSION,
+        });
+      }
       byPath.set(t.filePath, {
         worth_processing: triage.worth_processing,
         reasons: triage.reasons,
@@ -2605,7 +2648,7 @@ export async function runTriagePass(
     }
   }
 
-  return { reports, byPath, judged, cacheHits, unreliable: unreliableCount, deferred: deferredCount, tokens: { in: tokensIn, out: tokensOut } };
+  return { reports, byPath, judged, cacheHits, unreliable: unreliableCount, deferred: deferredCount, tokens: { in: tokensIn, out: tokensOut }, ...(cfg.decide ? { decide: cfg.decide.stats } : {}) };
 }
 
 // ── Subagent prompt ──────────────────────────────────────────────────
@@ -3165,13 +3208,13 @@ async function writeSummaryPage(
 
   const { parseMarkdown } = await import('../markdown.ts');
   const parsed = parseMarkdown(fullMarkdown);
-  if (!maintenance) await engine.putPage(summarySlug, {
+  if (!maintenance) await maintenanceTransaction(engine, tx => tx.putPage(summarySlug, {
     type: parsed.type,
     title: parsed.title,
     compiled_truth: parsed.compiled_truth,
     timeline: parsed.timeline,
     frontmatter: parsed.frontmatter,
-  }, { sourceId });
+  }, { sourceId }));
 
   const fileWriteRaw = (await engine.getConfig('dream.synthesize.summary_file_write'))?.trim().toLowerCase();
   const fileWriteEnabled = !(fileWriteRaw === 'false' || fileWriteRaw === '0' || fileWriteRaw === 'off');

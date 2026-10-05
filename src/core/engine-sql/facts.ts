@@ -383,7 +383,7 @@ export async function listFactsSince(
     const excludeAuditRows = opts?.excludeAuditRows === true;
     const grepPat = grepPattern(opts);
     const rows = (await exec.run<FactRowSqlShape>(sqlFragment`
-      SELECT * FROM facts
+      SELECT *${opts?.fingerprint ? sqlFragment`, gbrain_fact_fingerprint(fact) AS fact_fingerprint` : sqlFragment``} FROM facts
       WHERE source_id = ${source_id}
         AND ${eventTime ? sqlFragment`COALESCE(valid_from, created_at)` : sqlFragment`created_at`} >= ${since}
         ${entitySlug ? sqlFragment`AND entity_slug = ${entitySlug}` : sqlFragment``}
@@ -400,6 +400,45 @@ export async function listFactsSince(
     return rows.map(rowToFact);
   }
 
+/**
+ * delta's facts arm (contributor audit wave P0): facts strictly after a
+ * `(created_at, id)` keyset, OLDEST first, so a caller that delivers a prefix
+ * can advance its keyset through exactly what it delivered. `after.id = null`
+ * means "strictly after the timestamp" (a legacy `since`). `created_at_iso`
+ * projects the column's microseconds: a keyset minted from a JS Date would
+ * re-select or skip same-millisecond rows, and the bound goes through
+ * `::text::timestamptz` so the postgres.js driver cannot truncate it to
+ * milliseconds on the way in. recall's newest-first
+ * `listFactsSince` is unchanged.
+ */
+export async function listFactsKeyset(
+  exec: LegacyUnscopedRead,
+  source_id: string,
+  after: { createdAt: string; id: number | null } | null,
+  opts?: FactListOpts,
+): Promise<FactRow[]> {
+  const limit = clampSearchLimit(opts?.limit, 50, MAX_SEARCH_LIMIT);
+  const activeOnly = opts?.activeOnly !== false;
+  const visibility = (opts?.visibility && opts.visibility.length > 0) ? opts.visibility : null;
+  const afterCondition = after === null
+    ? sqlFragment``
+    : after.id === null
+      ? sqlFragment`AND created_at > ${after.createdAt}::text::timestamptz`
+      : sqlFragment`AND (created_at > ${after.createdAt}::text::timestamptz OR (created_at = ${after.createdAt}::text::timestamptz AND id > ${after.id}))`;
+  const rows = (await exec.run<FactRowSqlShape>(sqlFragment`
+    SELECT *${opts?.fingerprint ? sqlFragment`, gbrain_fact_fingerprint(fact) AS fact_fingerprint` : sqlFragment``},
+           to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at_iso
+    FROM facts
+    WHERE source_id = ${source_id}
+      ${afterCondition}
+      ${activeOnly ? sqlFragment`AND expired_at IS NULL AND (valid_until IS NULL OR valid_until > now())` : sqlFragment``}
+      ${visibility ? sqlFragment`AND visibility = ANY(${visibility}::text[])` : sqlFragment``}
+    ORDER BY created_at ASC, id ASC
+    LIMIT ${limit}
+  `)).rows;
+  return rows.map(rowToFact);
+}
+
 export async function listFactsBySession(
   exec: LegacyUnscopedRead,
     source_id: string,
@@ -415,7 +454,7 @@ export async function listFactsBySession(
     const excludeAuditRows = opts?.excludeAuditRows === true;
     const grepPat = grepPattern(opts);
     const rows = (await exec.run<FactRowSqlShape>(sqlFragment`
-      SELECT * FROM facts
+      SELECT *${opts?.fingerprint ? sqlFragment`, gbrain_fact_fingerprint(fact) AS fact_fingerprint` : sqlFragment``} FROM facts
       WHERE source_id = ${source_id}
         AND source_session = ${sessionId}
         ${activeOnly ? sqlFragment`AND expired_at IS NULL AND (valid_until IS NULL OR valid_until > now())` : sqlFragment``}
@@ -462,9 +501,11 @@ export async function countUnconsolidatedFacts(exec: LegacyUnscopedRead, source_
     // Validity-lapsed rows are excluded too: the consolidator reads via
     // listFactsByEntity(activeOnly), which filters them at read time — counting
     // them here would report a backlog the consolidator can never drain.
+    // So are facts with no entity: consolidate reads (source, entity) buckets only (#5831).
     const rows = (await exec.run<{ count: number }>(sqlFragment`
       SELECT COUNT(*)::int AS count FROM facts
       WHERE source_id = ${source_id}
+        AND entity_slug IS NOT NULL
         AND consolidated_at IS NULL
         AND expired_at IS NULL
         AND (valid_until IS NULL OR valid_until > now())
@@ -654,6 +695,8 @@ interface FactRowSqlShape {
   embedded_text_hash?: string | null;
   embedded_at: Date | null;
   created_at: Date;
+  fact_fingerprint?: string | null;
+  created_at_iso?: string | null;
 }
 
 /**
@@ -705,6 +748,8 @@ function rowToFact(raw: FactRowSqlShape): FactRow {
     embedded_text_hash: row.embedded_text_hash ?? null,
     embedded_at: row.embedded_at,
     created_at: row.created_at,
+    ...(row.fact_fingerprint ? { fact_fingerprint: row.fact_fingerprint } : {}),
+    ...(row.created_at_iso ? { created_at_iso: row.created_at_iso } : {}),
   };
 }
 

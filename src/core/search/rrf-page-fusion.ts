@@ -48,6 +48,10 @@ export type RrfEntry = { result: SearchResult; score: number; own: number; keywo
 export function accumulateRrf(lists: ReadonlyArray<{ list: SearchResult[]; k: number; weight?: number }>): RrfEntry[] {
   const chunks = new Map<string, RrfEntry>();
   const pages = new Map<string, number>();
+  // Graph evidence is page-level: the relational arm may surface a page's
+  // canonical chunk while keyword/vector pick another chunk of the same page,
+  // so the evidence rides on whichever of the page's rows survives.
+  const graphEvidence = new Map<string, Partial<SearchResult>>();
   for (const { list, k, weight } of lists) {
     const w = weight ?? 1;
     const votedPages = new Set<string>();
@@ -59,6 +63,9 @@ export function accumulateRrf(lists: ReadonlyArray<{ list: SearchResult[]; k: nu
         votedPages.add(page);
         pages.set(page, (pages.get(page) ?? 0) + rrfScore);
       }
+      if (!graphEvidence.has(page) && (r.relational !== undefined || r.relational_seed !== undefined)) {
+        graphEvidence.set(page, pickGraphEvidence(r));
+      }
       const key = rrfKey(r);
       const existing = chunks.get(key);
       if (existing) {
@@ -67,12 +74,24 @@ export function accumulateRrf(lists: ReadonlyArray<{ list: SearchResult[]; k: nu
         // first saw via a vector list must still read keyword_hit when the
         // keyword arm ALSO surfaced it.
         if (r.keyword_hit === true) existing.keywordHit = true;
+        // A strict appearance in any list outranks the OR-relaxed fallback:
+        // the fused row is relaxed only when every list that held it was.
+        if (existing.result.keyword_relaxed === true && r.keyword_relaxed !== true) {
+          const { keyword_relaxed: _relaxed, ...strict } = existing.result;
+          existing.result = strict;
+        }
       } else {
         chunks.set(key, { result: r, score: 0, own: rrfScore, keywordHit: r.keyword_hit === true });
       }
     }
   }
   const entries = Array.from(chunks.values());
+  for (const e of entries) {
+    const evidence = graphEvidence.get(rrfPageKey(e.result));
+    if (evidence && e.result.relational === undefined && e.result.relational_seed === undefined) {
+      e.result = { ...e.result, ...evidence };
+    }
+  }
   const leads = new Map<string, RrfEntry>();
   for (const e of entries) {
     e.score = e.own;
@@ -82,4 +101,12 @@ export function accumulateRrf(lists: ReadonlyArray<{ list: SearchResult[]; k: nu
   }
   for (const [page, lead] of leads) lead.score = pages.get(page) ?? lead.own;
   return entries;
+}
+
+const GRAPH_EVIDENCE_FIELDS = ['relational', 'relational_seed', 'relational_hop', 'relational_path', 'relational_via_link_types'] as const;
+
+function pickGraphEvidence(r: SearchResult): Partial<SearchResult> {
+  const out: Record<string, unknown> = {};
+  for (const f of GRAPH_EVIDENCE_FIELDS) if (r[f] !== undefined) out[f] = r[f];
+  return out as Partial<SearchResult>;
 }

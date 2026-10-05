@@ -5,6 +5,7 @@
  * returns false), so on the production path only resolveCacheSearchMode and
  * semanticCacheSkipped run.
  */
+import { normalizeChainSlots } from '../relational-chain.ts';
 import type { BrainEngine } from '../../engine.ts';
 import type { HybridSearchMeta, SearchResult } from '../../types.ts';
 import { type HybridSearchOpts, cacheScopeKey, filterResultsByCallerScope } from '../hybrid.ts';
@@ -22,6 +23,9 @@ import { normalizeRelationalRerankPin } from '../relational-rerank-pin.ts';
 import { recordSearchTelemetry } from '../telemetry.ts';
 import { resolveEffectiveRecency, resolveEffectiveSalience } from './effective-modes.ts';
 import { resolveHardExcludes } from '../source-boost.ts';
+import { loadConfigSnapshot } from '../../config-snapshot.ts';
+import { pickDecideConfig } from '../../ai/decide/config.ts';
+import { decideKnobsPart, resolveDecideSearchContext } from '../decide-stage.ts';
 
 /** What prepareSemanticCache hands the wrapper when result caching is available. */
 export interface SemanticCacheHandle {
@@ -78,6 +82,10 @@ export async function resolveCacheSearchMode(engine: BrainEngine, opts: HybridSe
       expansion_variant_budget: normalizeExpansionVariantBudget(opts?.expansionVariantBudget),
       // Ranker wave — threaded here too so knobsHash's `rrp=` part reflects the per-call pin.
       relational_rerank_pin: normalizeRelationalRerankPin(opts?.relationalRerankPin),
+      // Multi-hop planner — threaded here too so knobsHash's `rp=`/`ro=` parts reflect per-call values.
+      relational_planner: typeof opts?.relationalPlanner === 'boolean' ? opts.relationalPlanner : undefined,
+      relational_orient_onehop: typeof opts?.relationalOrientOneHop === 'boolean' ? opts.relationalOrientOneHop : undefined,
+      relational_chain_slots: normalizeChainSlots(opts?.relationalChainSlots),
       // Ranker wave (Phase E2) — threaded here too so knobsHash's `kacf=` part reflects the per-call floor.
       keyword_arm_confidence_floor: normalizeKeywordArmConfidenceFloor(opts?.keywordArmConfidenceFloor),
       // Ranker wave (Phase E3) — threaded here too so knobsHash's `mbg=` part reflects the per-call gate.
@@ -127,7 +135,13 @@ export async function prepareSemanticCache(
 
   // Cache key carries the column + provider so different embedding spaces
   // never collide on the same `(source_id, query_text)` row.
+  const decideSnapshot = pickDecideConfig(await loadConfigSnapshot(engine));
+  const decideCtx = decideSnapshot ? await resolveDecideSearchContext(engine, decideSnapshot, {
+    rerankerModel: resolvedForCache.reranker_model, rerankerEnabled: resolvedForCache.reranker_enabled, decide: opts?.decide,
+  }).catch(() => undefined) : undefined;
+  const decideKnobs = decideKnobsPart(decideCtx);
   const cacheKnobsHash = knobsHash(resolvedForCache, {
+    ...(decideKnobs ? { decide: decideKnobs } : {}),
     embeddingColumn: resolvedColCached.name,
     embeddingModel: resolvedColCached.embeddingModel,
     // #2825 — fold the resolved hard-exclude prefix list (defaults ∪
